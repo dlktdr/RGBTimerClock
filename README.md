@@ -9,8 +9,10 @@ Currently uses ESPnow for wireless communication.
 
 Will switch over to BLE so I can free up the Wifi and incoroprate NTP and use as a real clock too.
 
-Face plate 1 - Needs to be set back more haven't cut it yet.
+Face plate 1 - Ok (Kind of like it, wasn't my best paint job on the back
+![PXL_20220601_052104484](https://user-images.githubusercontent.com/281145/171333415-3501a350-1814-4ee9-b4ae-50da5fcec186.jpg)
 
+Face plate 2 - Needs to have the spacers and diffuser added still, lights are too visible
 ![PXL_20220601_050759192](https://user-images.githubusercontent.com/281145/171332422-1844654c-b102-4cc1-b350-bfc79f449df7.jpg)
 
 Mounting board
