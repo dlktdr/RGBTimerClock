@@ -13,15 +13,16 @@
 /*#define LED_R 255
 #define LED_G 0
 #define LED_B 90*/
-#define TIMER_HISTORY 10
+#define TIMER_MAX_MINS 5999990000
+#define TIMER_MAX_SECS 999990000
 
 #define LED_R 45
 #define LED_G 0
 #define LED_B 10
 
 // Replace with your network credentials
-const char *ssid     = "ShopWireless";
-const char *password = "Shop1234";
+const char *ssid     = "MY SSID";
+const char *password = "MY SSID PASSWORD";
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "pool.ntp.org");
@@ -38,6 +39,13 @@ NTPClient timeClient(ntpUDP, "pool.ntp.org");
  *   u    - Mode is in Up count
  *   d(t) - Mode is in Down count. t = Preset Time
  *   F(t) - Current Time
+ *   M    - Set Display to Minutes
+ *   m    - Display is in Minutes
+ *   S    - Set Display to Seconds
+ *   s    - Display is in seconds*
+ *   N    - Set Display to NTP Time
+ *   n    - Display is in Time
+
  */
 
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -45,12 +53,15 @@ esp_now_peer_info_t peerInfo;
 int64_t currenttime=0; // In us
 int64_t presettime=300000; // In us
 
+#define DOWN_FINISHED_FLASH_RATE 200000
+
 enum {
   TmrMode_Stopwatch,
   TmrMode_DownTimer,
+  TmrMode_Time,
   TmrMode_Count
 };
-volatile int TmrMode = TmrMode_Stopwatch;
+volatile uint TmrMode = TmrMode_Stopwatch;
 
 enum {
   TmrDown_Setup,
@@ -58,25 +69,25 @@ enum {
   TmrDown_Counting,
   TmrDown_Complete
 };
-volatile int DwnTimerState = TmrDown_Idle;
+volatile uint DwnTimerState = TmrDown_Idle;
 
 enum {
-  TmrDisplay_Mins=0,
-  TmrDisplay_Seconds,
+  TmrDisplay_Mins=0,  // show in MM:SS.SS up to 99:59.99
+  TmrDisplay_Seconds, // Show in seconds up to 999.99s
   TmrDisplay_Count
 };
-volatile int TmrDisplay = TmrDisplay_Mins;
+volatile uint TmrDisplay = TmrDisplay_Mins;
 
 enum {
-  TmrState_Reset,
-  TmrState_Running,
+  TmrState_Reset, // Waiting for Start
+  TmrState_Running, // Counting up/down
   TmrState_Paused,
-  TmrState_Stop,
+  TmrState_Stop, // Timer complete. On down count Flash 0. On Up Count = Overflow
 };
 volatile int TmrState = TmrState_Reset;
 
-#define NOPIXELS 129
-#define DO_PIN 22
+#define NOPIXELS 129 // 5x 8SegmentNumbers(4+3+4+3+4+3+4) + 2x Colen + 2x Decimal Places
+#define DO_PIN 22 // LED Pin
 
 void sendData(const char *data)
 {
@@ -116,10 +127,16 @@ void updateTime()
       currenttime += (esp_timer_get_time() - usecs);
     else { // Down Count
       currenttime -= (esp_timer_get_time() - usecs);
-      if(currenttime <= 0) {
-        currenttime = 0;
-        TmrState = TmrState_Stop;
-      }
+    }
+    if(currenttime <= 0) {
+      currenttime = 0;
+      TmrState = TmrState_Stop;
+    } else if (currenttime > TIMER_MAX_MINS && TmrDisplay == TmrDisplay_Mins) {
+      currenttime = TIMER_MAX_MINS;
+      TmrState = TmrState_Stop;
+    } else if (currenttime > TIMER_MAX_SECS && TmrDisplay == TmrDisplay_Seconds) {
+      currenttime = TIMER_MAX_SECS;
+      TmrState = TmrState_Stop;
     }
   }
   usecs = esp_timer_get_time();
@@ -130,9 +147,9 @@ void buildDigits()
   static uint64_t curtime = 0;
   static bool showdigits=true;
   // Flash the Zero's
-  if(TmrState == TmrState_Stop && TmrMode == TmrMode_DownTimer) {
+  if(TmrState == TmrState_Stop && TmrMode == TmrMode_DownTimer && currenttime == 0) {
     if(curtime < esp_timer_get_time()) {
-      curtime = esp_timer_get_time() + 200000; // 0.2sec
+      curtime = esp_timer_get_time() + DOWN_FINISHED_FLASH_RATE; // 0.2sec
       showdigits = !showdigits;
     }
   } else {
@@ -310,37 +327,12 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   incoming[10] = '\0';
   char function = incoming[0];
 
-  switch(function) {
-    case '*':
-      Serial.println("Start Rec");
-      break;
-    case 'X':
-      Serial.println("Stop Rec");
-      break;
-    case 'T':
-      Serial.println("Toggle Rec");
-      break;
-    case 'R':
-      Serial.println("Reset Rec");
-      break;
-    default:
-      Serial.println("Unknown Rec");
-      break;
-  }
+  bool saveToEEPROM = false;
 
-  // Toggle (start/stop)
-  if(function == 'T') {
-    if(TmrState == TmrState_Running)
-      function = 'X'; // Stop
-    if(TmrState == TmrState_Stop ||
-       TmrState == TmrState_Paused ||
-       TmrState == TmrState_Reset)
-      function = '*'; // Start
-  }
-
-  if(function == ' ') // Communication with device
+  if(function == ' ') // Communication with device active
     Serial.print(".");
   else if(function == 'X') { // Stop
+    Serial.println("Stop Rec");
     switch(TmrState) {
       case TmrState_Running:
         // Store Exact current time
@@ -354,6 +346,7 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         break;
     }
   } else if(function == '*') { // Start
+    Serial.println("Start Rec");
     switch(TmrState) {
       case TmrState_Reset:
       case TmrState_Stop:
@@ -365,44 +358,92 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
         break;
     }
   } else if(function == 'R') { // Reset
-    //switch(TmrState) {
-      //case TmrState_Stop:
-        // Set current time
-        if(TmrMode == TmrMode_Stopwatch)
-          currenttime = 0;
-        else if(TmrMode == TmrMode_DownTimer)
-          currenttime = presettime*1000;
-        TmrState = TmrState_Reset;
-    //    break;
-    //}
+    Serial.println("Reset Rec");
+    // Only allow reset when timer not running
+    if(TmrState != TmrState_Running) {
+      if(TmrMode == TmrMode_Stopwatch)
+        currenttime = 0;
+      else if(TmrMode == TmrMode_DownTimer)
+        currenttime = presettime;
+      TmrState = TmrState_Reset;
+    }
   } else if(function == 'D') { // Down Count Mode
+    int64_t nprsttime = atoi(incoming+1) * 1000;
+    if(TmrMode != TmrMode_DownTimer || nprsttime != presettime) {
+      saveToEEPROM = true;
+    }
+    presettime = nprsttime;
+    Serial.printf("Down count mode rec, Preset = %lld\r\n", presettime);
     TmrMode = TmrMode_DownTimer;
-    presettime = atoi(incoming+1) * 1000;
-    Serial.printf("Down count mode, Preset = %lld\r\n", presettime);
     TmrState = TmrState_Stop;
     currenttime = presettime;
   } else if(function == 'U') { // Stopwatch Mode
+    Serial.println("Stop Watch Mode Rec");
+    if(TmrMode != TmrMode_Stopwatch) {
+      saveToEEPROM = true;
+    }
     TmrMode = TmrMode_Stopwatch;
-    TmrState = TmrState_Reset;
     currenttime = 0;
+  } else if(function == 'M') { // Display in minutes
+    Serial.println("Set Display to minutes");
+    if(TmrDisplay != TmrDisplay_Mins) {
+      TmrDisplay = TmrDisplay_Mins;
+      saveToEEPROM = true;
+    }
+  } else if(function == 'S') { // Display in seconds
+    Serial.println("Set Display to seconds");
+    if(TmrDisplay != TmrDisplay_Seconds) {
+      TmrDisplay = TmrDisplay_Seconds;
+      saveToEEPROM = true;
+    }
+  } else if(function == 'N') { // Display in NTP Time
+    Serial.println("Set Display to Internet NTP Time");
+    if(TmrMode != TmrMode_Time) {
+      TmrMode = TmrMode_Time;
+      saveToEEPROM = true;
+    }
+  } else {
+    Serial.printf("***Unknown command %c\r\b", function);
   }
+
+  // TODO: Add a delay here, save some write cycles
+  if(saveToEEPROM) {
+    Serial.println("Saved data to EEPROM");
+    EEPROM.writeLong64(0, presettime);
+    EEPROM.writeUInt(8, TmrMode);
+    EEPROM.writeUInt(12, TmrDisplay);
+    EEPROM.commit();
+  }
+
 }
 
 void setup() {
   // Initialize Serial Monitor
   Serial.begin(115200);
 
+  // Load Settings
   EEPROM.begin(100);
   presettime = EEPROM.readLong64(0);
-  if(presettime > 5940000000) {
-    // 99 Mins
-    presettime = 0;
-    EEPROM.writeLong64(0,0);
-  }
-  // Strip remainder
-  presettime = (presettime / 10000) * 10000;
+  if(presettime > TIMER_MAX_MINS) { // 99mm:99.99ss
+    presettime = TIMER_MAX_MINS;
+    EEPROM.writeLong64(0,presettime);
 
-  TmrMode = EEPROM.readBool(5);
+  } else if(presettime < 0) {
+    presettime = 0;
+    EEPROM.writeLong64(0,presettime);
+  } else {
+    presettime = (presettime / 10000) * 10000;
+  }
+  TmrMode = EEPROM.readUInt(8);
+  if(TmrMode >= TmrMode_Count) {
+    TmrMode = 0;
+    EEPROM.writeUInt(8,TmrMode);
+  }
+  TmrDisplay = EEPROM.readUInt(12);
+  if(TmrDisplay >= TmrDisplay_Count) {
+    TmrDisplay = TmrDisplay_Mins;
+    EEPROM.writeUInt(12,TmrDisplay);
+  }
 
   // Connect to Wi-Fi
   /*Serial.print("Connecting to ");
@@ -470,22 +511,36 @@ void loop() {
     buildDigits();
 
   // Periodically Send if The timer is running and the time
-  // to sync up remote screens
+  // to sync up remote screen(s)
   static int cnt=0;
   if(cnt++ == 400) {
     cnt = 0;
+    // Send timer running
     if(TmrState != TmrState_Running)
       sendData("@         ");
     else {
       sendData("#         ");
     }
+
+    // Send up/down mode
     if(TmrMode == TmrMode_DownTimer) {
       char sendchar[11];
       sprintf(sendchar, "d%09lld", presettime/1000); // Force update remote screen to perfectly match
       sendData(sendchar);
-    } else {
+    } else if(TmrMode == TmrMode_Stopwatch) {
       sendData("u         ");
+    } else if(TmrMode == TmrMode_Time ){
+      sendData("n         ");
     }
+
+    // Send display mode
+    if(TmrDisplay == TmrDisplay_Seconds) {
+      sendData("s         ");
+    } else if(TmrDisplay == TmrDisplay_Mins){
+      sendData("m         ");
+    }
+
+    // Send current time
     char sendchar[11];
     sprintf(sendchar, "F%09lld", currenttime/1000); // Force update remote screen to perfectly match
     sendData(sendchar);

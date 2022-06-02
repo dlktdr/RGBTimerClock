@@ -6,7 +6,6 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <EEPROM.h>
 #include "EasyButton.h"
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
@@ -27,20 +26,13 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
  *   u    - Mode is in Up count
  *   d(t) - Mode is in Down count. t = Preset Time
  *   F(t) - Current Time
+ *   M    - Set Display to Minutes
+ *   m    - Display is in Minutes
+ *   S    - Set Display to Seconds
+ *   s    - Display is in seconds
+ *   N    - Set Display to NTP Time
+ *   n    - Display is in Time
  */
-
-/*
-  Rui Santos
-  Complete project details at https://RandomNerdTutorials.com/esp-now-esp32-arduino-ide/
-
-  Permission is hereby granted, free of charge, to any person obtaining a copy
-  of this software and associated documentation files.
-
-  The above copyright notice and this permission notice shall be included in all
-  copies or substantial portions of the Software.
-*/
-
-// REPLACE WITH YOUR RECEIVER MAC Address
 
 int64_t delaytimer=0;
 uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -60,9 +52,10 @@ bool inMenu=false;
 enum {
   TmrMode_Stopwatch,
   TmrMode_DownTimer,
+  TmrMode_Time,
   TmrMode_Count
 };
-int TmrMode = TmrMode_Stopwatch;
+volatile uint TmrMode = TmrMode_Stopwatch;
 
 enum {
   TmrDown_Setup,
@@ -70,14 +63,14 @@ enum {
   TmrDown_Counting,
   TmrDown_Complete
 };
-int DwnTimerState = TmrDown_Idle;
+volatile int DwnTimerState = TmrDown_Idle;
 
 enum {
   TmrDisplay_Mins=0,
   TmrDisplay_Seconds,
   TmrDisplay_Count
 };
-int TmrDisplay = TmrDisplay_Mins;
+volatile uint TmrDisplay = TmrDisplay_Mins;
 
 enum {
   TmrMenu_Mode=0,
@@ -86,7 +79,7 @@ enum {
   //TmrMenu_RGB, // Set Display Color
   TmrMenu_Count
 };
-int TimerMenu = TmrMenu_Mode;
+volatile uint TimerMenu = TmrMenu_Mode;
 
 void sendData(const char *data)
 {
@@ -172,15 +165,15 @@ void IRAM_ATTR ISRToggle() {
       } else {
         presettime += step;
       }
-      char data[11];
-      sprintf(data, "D%09lld", presettime);
-      sendData(data);
-
   } else {
-    // Don't resend it waiting for debounce
-
-    debounce[2] = true;
-    sendData("T         ");
+    if(timerrunning) {
+      sendData("X         "); // Stop
+      sendData("X         "); // Stop... JIC first one lost. not accurate but a backup
+    } else {
+      sendData("*         "); // Start
+      sendData("*         "); // Start... JIC first one lost. not accurate but a backup
+    }
+    // Update local
     timerrunning = !timerrunning;
   }
 }
@@ -191,6 +184,7 @@ void MenuButtonLongPressed()
   // Enter Setup Mode
   if(!inMenu) {
     inMenu = true;
+    TimerMenu = 0;
 
   // Already in setup.
   } else {
@@ -200,22 +194,28 @@ void MenuButtonLongPressed()
     if(TimerMenu == TmrMenu_Time && TmrMode == TmrMode_Stopwatch)
       TimerMenu++;
 
+    // Skip all if in Time Mode
+    if(TimerMenu == TmrMenu_Mode+1 && TmrMode == TmrMode_Time)
+      TimerMenu = TmrMenu_Count;
+
     // End of Menu Quit
     if(TimerMenu == TmrMenu_Count) {
       TimerMenu = 0;
       inMenu = false;
-      // Send new mode to remote
+
       if(TmrMode == TmrMode_DownTimer) {
         char data[11];
         sprintf(data, "D%09lld", presettime);
         sendData(data);
-        EEPROM.writeLong64(0,presettime);
-        EEPROM.commit();
-      } else {
-        char data[11];
-        sprintf(data, "U         ");
-        sendData(data);
+      } else if(TmrMode == TmrMode_Stopwatch) {
+        sendData("U         ");
+      } else if(TmrMode == TmrMode_Time) {
+        sendData("N         ");
       }
+      if(TmrDisplay == TmrDisplay_Mins)
+        sendData("M         ");
+      else if(TmrDisplay == TmrDisplay_Seconds)
+        sendData("S         ");
     }
   }
 }
@@ -224,28 +224,24 @@ void MenuButtonPressed()
 {
   if(inMenu) {
     switch(TimerMenu) {
-      case TmrMenu_Mode:
+      case TmrMenu_Mode: {
         TmrMode++;
         if(TmrMode == TmrMode_Count)
           TmrMode = 0;
-        if(TmrMode == TmrMode_DownTimer) {
-          char data[11];
-          sprintf(data, "D%09lld", presettime);
-          sendData(data);
-        } else {
-          char data[11];
-          sprintf(data, "U         ");
-          sendData(data);
-        }
         break;
-      case TmrMenu_Time:
+      }
+      case TmrMenu_Time: {
         cursorposition++;
         if(cursorposition > 5)
           cursorposition = 0;
-      case TmrMenu_MinsSecs:
+        break;
+      }
+      case TmrMenu_MinsSecs: {
         TmrDisplay++;
         if(TmrDisplay == TmrDisplay_Count)
           TmrDisplay = 0;
+        break;
+      }
     }
   }
 
@@ -260,34 +256,46 @@ void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   memcpy(&incoming, incomingData, 10);
   incoming[10] = '\0';
 
-  switch(incoming[0]) {
-    case 'F': {
-      uint32_t time = atoi(incoming+1);
-      Serial.printf("TimeRec = %d\r\n", time);
-      timerval = time;
-      break;
+  if(!inMenu) {
+    switch(incoming[0]) {
+      case 'F': {
+        uint32_t time = atoi(incoming+1);
+        Serial.printf("TimeRec = %d\r\n", time);
+        timerval = time;
+        break;
+      }
+      case '@': {
+        timerrunning = false;
+        break;
+      }
+      case '#': {
+        timerrunning = true;
+        break;
+      }
+      case 'u': {
+        TmrMode = TmrMode_Stopwatch;
+        break;
+      }
+      case 'd': { // Down Count Mode
+        uint32_t time = atoi(incoming+1);
+        Serial.printf("TimeRec = %d\r\n", time);
+        presettime = time;
+        TmrMode = TmrMode_DownTimer;
+        break;
+      }
+      case 's': {
+        TmrDisplay = TmrDisplay_Seconds;
+        break;
+      }
+      case 'm': {
+        TmrDisplay = TmrDisplay_Mins;
+        break;
+      }
+      case 'n': {
+        TmrMode = TmrMode_Time;
+        break;
+      }
     }
-    case '@': {
-      timerrunning = false;
-      break;
-    }
-    case '#': {
-      timerrunning = true;
-      break;
-    }
-    case 'u': {
-      TmrMode = TmrMode_Stopwatch;
-      break;
-    }
-    case 'd': { // Down Count Mode
-      timerrunning = true;
-      uint32_t time = atoi(incoming+1);
-      Serial.printf("TimeRec = %d\r\n", time);
-      presettime = time * 1000;
-      TmrMode = TmrMode_DownTimer;
-      break;
-    }
-
   }
 }
 
@@ -295,16 +303,8 @@ void setup() {
   // Init Serial Monitor
   Serial.begin(115200);
 
-  EEPROM.begin(100);
-  presettime = EEPROM.readLong64(0);
-  if(presettime > 5940000000) {
-    // 99 Mins
-    presettime = 0;
-    EEPROM.writeLong64(0,0);
-  }
-
   // Strip remainder
-  presettime = (presettime / 10000) * 10000;
+  presettime = 0;
 
   // Set device as a Wi-Fi Station
   WiFi.mode(WIFI_STA);
@@ -432,14 +432,29 @@ void loop() {
         display.setCursor(15, 20);
         display.printf("%02d:%02d.%02d",minutes, seconds, milisec / 10);
         break;
+      case TmrMode_Time:
+        display.setTextColor(WHITE);
+        display.setCursor(43, 50);
+        display.printf("Time");
+        display.setTextSize(2); // Draw 2X-scale text
+        minutes = timerval / 60000;
+        seconds = (timerval - (minutes * 60000)) / 1000;
+        milisec = (timerval - (minutes * 60000) - (seconds * 1000));
+        display.setCursor(15, 20);
+        display.printf("%02d:%02d.%02d",minutes, seconds, milisec / 10);
+        break;
     }
 
   // Menu Mode
   } else {
+    //display.drawRect(1,1,SCREEN_WIDTH-2, 50,WHITE);
+    display.fillRect(0,48,SCREEN_WIDTH,SCREEN_HEIGHT-48,WHITE);
     switch(TimerMenu) {
       case TmrMenu_Mode:
         display.setCursor(45,50);
+        display.setTextColor(BLACK);
         display.printf("Mode");
+        display.setTextColor(WHITE);
         switch(TmrMode) {
           case TmrMode_DownTimer:
             display.setCursor(10,20);
@@ -449,11 +464,18 @@ void loop() {
             display.setCursor(10,20);
             display.printf("StopWatch");
             break;
+          case TmrMode_Time:
+            display.setCursor(43,20);
+            display.printf("Time");
+            break;
+
         }
         break;
         case TmrMenu_MinsSecs: {
           display.setCursor(24,48);
+          display.setTextColor(BLACK);
           display.printf("Display");
+          display.setTextColor(WHITE);
           switch (TmrDisplay)
           {
           case TmrDisplay_Mins:
@@ -473,7 +495,9 @@ void loop() {
         break;*/
       case TmrMenu_Time:
         display.setCursor(25,50);
+        display.setTextColor(BLACK);
         display.printf("Timeout");
+        display.setTextColor(WHITE);
         minutes = presettime / 60000;
         seconds = (presettime - (minutes * 60000)) / 1000;
         milisec = (presettime - (minutes * 60000) - (seconds * 1000));
